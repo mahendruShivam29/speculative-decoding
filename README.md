@@ -22,6 +22,15 @@ For speculative decoding it also reports:
 - average acceptance rate,
 - average number of accepted draft tokens per speculative step.
 
+It also prints extra instrumentation to help analyze why a run sped up or slowed down:
+
+- average draft-model calls,
+- average target-model calls,
+- average draft, verification, and commit time,
+- average proposal-token transfers,
+- average replacement-token transfers,
+- average speculative steps.
+
 ## Recommended model pair for Colab Plus
 
 This project is set up for the following practical pair:
@@ -80,17 +89,19 @@ python main.py --prompts-file prompts.txt
 ## Design decisions
 
 - The implementation uses one tokenizer, loaded from the target model family, because speculative decoding works best when draft and target share the same tokenization scheme.
-- Greedy decoding is implemented token-by-token with the target model only.
-- Speculative decoding is implemented in a simplified assignment-friendly form.
-  The draft model proposes `k` tokens, the target model verifies them, the matching prefix is accepted, the first mismatch is replaced by the target token, and decoding continues until 100 new tokens are produced.
+- Greedy decoding is implemented with KV cache enabled so that, after prompt prefill, only one new token is processed per step.
+- Speculative decoding keeps separate draft and target prefix state with KV cache enabled on both models.
+  The draft model proposes `k` tokens incrementally from cached state, the target model verifies them in one cached forward pass per speculative step, and the accepted prefix is committed by truncating speculative KV state instead of replaying accepted tokens.
 - The script keeps `draft_device` and `target_device` as explicit parameters so the same code path can be used for both single-GPU development and real two-GPU validation.
+- The implementation transfers only proposal tokens to the target device and only the replacement token back to the draft device. It does not resend the full context each step.
 
 ## Expected bottlenecks
 
 On Colab Plus with a single T4, the likely bottlenecks are:
 
 - target-model forward pass latency,
-- repeated full-sequence recomputation in the simplified implementation,
+- repeated draft proposal work when acceptance is low,
+- remaining verification overhead on the target model,
 - limited VRAM forcing quantization,
 - lack of true cross-GPU parallelism.
 

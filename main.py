@@ -43,6 +43,7 @@ class BenchmarkResult:
     speedup_vs_greedy: float = 1.0
     avg_acceptance_rate: float | None = None
     avg_accepted_tokens_per_step: float | None = None
+    extra_metrics: Dict[str, float] | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,10 +137,53 @@ def load_tokenizer(model_name: str, trust_remote_code: bool):
 
 
 def choose_next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    if logits.ndim == 3 and logits.shape[1] == 1:
+        logits = logits[:, -1, :]
+
     if temperature <= 0:
-        return torch.argmax(logits, dim=-1, keepdim=True)
+        if logits.ndim == 2:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+        return torch.argmax(logits, dim=-1)
+
     probs = torch.softmax(logits / temperature, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
+    vocab_size = probs.shape[-1]
+    probs_2d = probs.reshape(-1, vocab_size)
+    samples = torch.multinomial(probs_2d, num_samples=1)
+    if logits.ndim == 2:
+        return samples.reshape(probs.shape[0], 1)
+    return samples.reshape(*probs.shape[:-1])
+
+
+def sync_if_cuda(device: str) -> None:
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def truncate_kv_cache(past_key_values, keep_length: int):
+    if past_key_values is None:
+        return None
+
+    if hasattr(past_key_values, "crop") and callable(past_key_values.crop):
+        past_key_values.crop(keep_length)
+        return past_key_values
+
+    truncated_layers = []
+    for layer in past_key_values:
+        truncated_tensors = []
+        for tensor in layer:
+            if tensor is None:
+                truncated_tensors.append(None)
+            elif tensor.ndim >= 3:
+                truncated_tensors.append(tensor[:, :, :keep_length, :])
+            else:
+                truncated_tensors.append(tensor)
+        truncated_layers.append(tuple(truncated_tensors))
+    return tuple(truncated_layers)
+
+
+def warmup_model_state(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+    return outputs.past_key_values, outputs.logits[:, -1, :]
 
 
 def greedy_generate(
@@ -153,87 +197,30 @@ def greedy_generate(
     encoded = tokenizer(prompt, return_tensors="pt")
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
-    generated = input_ids
-    mask = attention_mask
+    generated_tokens: List[torch.Tensor] = []
+    model_calls = 0
 
+    sync_if_cuda(device)
     start = time.perf_counter()
     with torch.inference_mode():
+        past_key_values, next_logits = warmup_model_state(model, input_ids=input_ids, attention_mask=attention_mask)
+        model_calls += 1
         for _ in range(max_new_tokens):
-            outputs = model(input_ids=generated, attention_mask=mask, use_cache=False)
-            next_token = choose_next_token(outputs.logits[:, -1, :], temperature)
-            generated = torch.cat([generated, next_token], dim=-1)
-            next_mask = torch.ones((mask.shape[0], 1), dtype=mask.dtype, device=device)
-            mask = torch.cat([mask, next_mask], dim=-1)
+            next_token = choose_next_token(next_logits, temperature)
+            generated_tokens.append(next_token.cpu())
+            outputs = model(input_ids=next_token, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            next_logits = outputs.logits[:, -1, :]
+            model_calls += 1
+    sync_if_cuda(device)
     runtime = time.perf_counter() - start
-    new_tokens = generated[:, input_ids.shape[1] :]
+    new_tokens = torch.cat(generated_tokens, dim=-1) if generated_tokens else torch.empty((1, 0), dtype=input_ids.dtype)
     return {
         "generated_text": tokenizer.decode(new_tokens[0], skip_special_tokens=True),
         "generated_tokens": max_new_tokens,
         "runtime_s": runtime,
+        "model_calls": model_calls,
     }
-
-
-def draft_propose(
-    model,
-    context_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    k: int,
-    temperature: float,
-) -> torch.Tensor:
-    generated = context_ids
-    mask = attention_mask
-    proposals: List[torch.Tensor] = []
-
-    with torch.inference_mode():
-        for _ in range(k):
-            outputs = model(input_ids=generated, attention_mask=mask, use_cache=False)
-            next_token = choose_next_token(outputs.logits[:, -1, :], temperature)
-            proposals.append(next_token)
-            generated = torch.cat([generated, next_token], dim=-1)
-            next_mask = torch.ones((mask.shape[0], 1), dtype=mask.dtype, device=mask.device)
-            mask = torch.cat([mask, next_mask], dim=-1)
-
-    return torch.cat(proposals, dim=-1)
-
-
-def verify_proposals(
-    model,
-    context_ids: torch.Tensor,
-    proposal_ids: torch.Tensor,
-    device: str,
-    temperature: float,
-) -> tuple[torch.Tensor, int, bool]:
-    context_on_target = context_ids.to(device)
-    proposal_on_target = proposal_ids.to(device)
-    combined = torch.cat([context_on_target, proposal_on_target], dim=-1)
-    attention_mask = torch.ones_like(combined, device=device)
-
-    with torch.inference_mode():
-        outputs = model(input_ids=combined, attention_mask=attention_mask, use_cache=False)
-    logits = outputs.logits
-
-    context_len = context_on_target.shape[1]
-    proposal_len = proposal_on_target.shape[1]
-    verify_logits = logits[:, context_len - 1 : context_len - 1 + proposal_len, :]
-
-    accepted = 0
-    replacement_token = None
-    all_accepted = True
-
-    for offset in range(proposal_len):
-        target_token = choose_next_token(verify_logits[:, offset, :], temperature)
-        draft_token = proposal_on_target[:, offset : offset + 1]
-        if torch.equal(target_token, draft_token):
-            accepted += 1
-            continue
-        replacement_token = target_token
-        all_accepted = False
-        break
-
-    if replacement_token is None:
-        replacement_token = torch.empty((proposal_on_target.shape[0], 0), dtype=proposal_on_target.dtype, device=device)
-
-    return replacement_token, accepted, all_accepted
 
 
 def speculative_generate(
@@ -248,48 +235,123 @@ def speculative_generate(
     temperature: float,
 ) -> Dict[str, object]:
     encoded = tokenizer(prompt, return_tensors="pt")
-    generated = encoded["input_ids"].to(draft_device)
-    mask = encoded["attention_mask"].to(draft_device)
-    original_length = generated.shape[1]
+    prompt_ids_draft = encoded["input_ids"].to(draft_device)
+    prompt_mask_draft = encoded["attention_mask"].to(draft_device)
+    prompt_ids_target = encoded["input_ids"].to(target_device)
+    prompt_mask_target = encoded["attention_mask"].to(target_device)
+
     steps = 0
     total_accepted = 0
+    generated_tokens: List[torch.Tensor] = []
+    draft_model_calls = 0
+    target_model_calls = 0
+    transferred_proposal_tokens = 0
+    transferred_replacement_tokens = 0
 
+    draft_time_s = 0.0
+    verify_time_s = 0.0
+    commit_time_s = 0.0
+
+    sync_if_cuda(draft_device)
+    sync_if_cuda(target_device)
     start = time.perf_counter()
-    while generated.shape[1] - original_length < max_new_tokens:
-        steps += 1
-        remaining = max_new_tokens - (generated.shape[1] - original_length)
-        proposal_len = min(k, remaining)
-        proposal_ids = draft_propose(
-            model=draft_model,
-            context_ids=generated,
-            attention_mask=mask,
-            k=proposal_len,
-            temperature=temperature,
-        )
+    with torch.inference_mode():
+        draft_outputs = draft_model(input_ids=prompt_ids_draft, attention_mask=prompt_mask_draft, use_cache=True)
+        draft_kv = draft_outputs.past_key_values
+        draft_model_calls += 1
 
-        replacement_token, accepted, all_accepted = verify_proposals(
-            model=target_model,
-            context_ids=generated,
-            proposal_ids=proposal_ids,
-            device=target_device,
-            temperature=temperature,
-        )
+        target_outputs = target_model(input_ids=prompt_ids_target, attention_mask=prompt_mask_target, use_cache=True)
+        target_kv = target_outputs.past_key_values
+        target_logits = target_outputs.logits[:, -1, :]
+        target_model_calls += 1
 
-        accepted_tokens = proposal_ids[:, :accepted]
-        if accepted > 0:
-            generated = torch.cat([generated, accepted_tokens], dim=-1)
-            accepted_mask = torch.ones((mask.shape[0], accepted), dtype=mask.dtype, device=draft_device)
-            mask = torch.cat([mask, accepted_mask], dim=-1)
-            total_accepted += accepted
+        next_token_target = choose_next_token(target_logits, temperature)
+        next_token_draft = next_token_target.to(draft_device)
 
-        if not all_accepted and generated.shape[1] - original_length < max_new_tokens:
-            replacement_on_draft = replacement_token.to(draft_device)
-            generated = torch.cat([generated, replacement_on_draft], dim=-1)
-            replacement_mask = torch.ones((mask.shape[0], 1), dtype=mask.dtype, device=draft_device)
-            mask = torch.cat([mask, replacement_mask], dim=-1)
+        generated_tokens.append(next_token_target.cpu())
+        committed_tokens = 1
+        seq_len = prompt_ids_target.shape[1]
 
+        while committed_tokens < max_new_tokens:
+            steps += 1
+            proposal_len = min(k, max_new_tokens - committed_tokens)
+
+            sync_if_cuda(draft_device)
+            t0 = time.perf_counter()
+            proposals: List[torch.Tensor] = []
+            curr_draft_kv = draft_kv
+            curr_token = next_token_draft
+
+            for _ in range(proposal_len):
+                out = draft_model(input_ids=curr_token, past_key_values=curr_draft_kv, use_cache=True)
+                curr_draft_kv = out.past_key_values
+                curr_token = choose_next_token(out.logits[:, -1, :], temperature)
+                proposals.append(curr_token)
+                draft_model_calls += 1
+
+            proposal_tensor_draft = torch.cat(proposals, dim=-1)
+            sync_if_cuda(draft_device)
+            draft_time_s += time.perf_counter() - t0
+
+            sync_if_cuda(target_device)
+            t1 = time.perf_counter()
+            proposal_tensor_target = proposal_tensor_draft.to(target_device)
+            transferred_proposal_tokens += proposal_len
+
+            target_input = torch.cat([next_token_target, proposal_tensor_target], dim=-1)
+            out = target_model(input_ids=target_input, past_key_values=target_kv, use_cache=True)
+            curr_target_kv = out.past_key_values
+            target_preds = choose_next_token(out.logits, temperature)
+            target_model_calls += 1
+
+            mismatch_index = proposal_len
+            for idx in range(proposal_len):
+                if proposal_tensor_target[0, idx] != target_preds[0, idx]:
+                    mismatch_index = idx
+                    break
+
+            sync_if_cuda(target_device)
+            verify_time_s += time.perf_counter() - t1
+
+            sync_if_cuda(draft_device)
+            sync_if_cuda(target_device)
+            t2 = time.perf_counter()
+
+            accepted_proposals = proposal_tensor_target[:, :mismatch_index]
+            replacement_token = target_preds[:, mismatch_index : mismatch_index + 1]
+
+            if mismatch_index > 0:
+                generated_tokens.append(accepted_proposals.cpu())
+            if committed_tokens + mismatch_index < max_new_tokens:
+                generated_tokens.append(replacement_token.cpu())
+                transferred_replacement_tokens += 1
+
+            total_accepted += mismatch_index
+            committed_tokens += mismatch_index + 1
+
+            keep_length = seq_len + 1 + mismatch_index
+            target_kv = truncate_kv_cache(curr_target_kv, keep_length)
+
+            if mismatch_index == proposal_len:
+                out_draft_extra = draft_model(input_ids=proposal_tensor_draft[:, -1:], past_key_values=curr_draft_kv, use_cache=True)
+                draft_kv = out_draft_extra.past_key_values
+                draft_model_calls += 1
+            else:
+                draft_kv = truncate_kv_cache(curr_draft_kv, keep_length)
+
+            seq_len = keep_length
+            next_token_target = replacement_token
+            next_token_draft = next_token_target.to(draft_device)
+
+            sync_if_cuda(draft_device)
+            sync_if_cuda(target_device)
+            commit_time_s += time.perf_counter() - t2
+
+    sync_if_cuda(draft_device)
+    sync_if_cuda(target_device)
     runtime = time.perf_counter() - start
-    new_tokens = generated[:, original_length : original_length + max_new_tokens]
+
+    new_tokens = torch.cat(generated_tokens, dim=-1)[:, :max_new_tokens]
     acceptance_rate = total_accepted / max_new_tokens if max_new_tokens else math.nan
     accepted_per_step = total_accepted / steps if steps else math.nan
 
@@ -299,6 +361,14 @@ def speculative_generate(
         "runtime_s": runtime,
         "acceptance_rate": acceptance_rate,
         "accepted_tokens_per_step": accepted_per_step,
+        "draft_model_calls": draft_model_calls,
+        "target_model_calls": target_model_calls,
+        "draft_time_s": draft_time_s,
+        "verify_time_s": verify_time_s,
+        "commit_time_s": commit_time_s,
+        "proposal_tokens_transferred": transferred_proposal_tokens,
+        "replacement_tokens_transferred": transferred_replacement_tokens,
+        "speculative_steps": steps,
     }
 
 
@@ -314,9 +384,24 @@ def aggregate_results(
 
     acceptance_rate = None
     accepted_tokens_per_step = None
+    extra_metrics = None
     if "acceptance_rate" in runs[0]:
         acceptance_rate = statistics.mean(float(run["acceptance_rate"]) for run in runs)
         accepted_tokens_per_step = statistics.mean(float(run["accepted_tokens_per_step"]) for run in runs)
+        extra_metrics = {
+            "draft_model_calls": statistics.mean(float(run["draft_model_calls"]) for run in runs),
+            "target_model_calls": statistics.mean(float(run["target_model_calls"]) for run in runs),
+            "draft_time_s": statistics.mean(float(run["draft_time_s"]) for run in runs),
+            "verify_time_s": statistics.mean(float(run["verify_time_s"]) for run in runs),
+            "commit_time_s": statistics.mean(float(run["commit_time_s"]) for run in runs),
+            "proposal_tokens_transferred": statistics.mean(float(run["proposal_tokens_transferred"]) for run in runs),
+            "replacement_tokens_transferred": statistics.mean(float(run["replacement_tokens_transferred"]) for run in runs),
+            "speculative_steps": statistics.mean(float(run["speculative_steps"]) for run in runs),
+        }
+    elif "model_calls" in runs[0]:
+        extra_metrics = {
+            "model_calls": statistics.mean(float(run["model_calls"]) for run in runs),
+        }
 
     return BenchmarkResult(
         method=method,
@@ -328,6 +413,7 @@ def aggregate_results(
         speedup_vs_greedy=speedup_vs_greedy,
         avg_acceptance_rate=acceptance_rate,
         avg_accepted_tokens_per_step=accepted_tokens_per_step,
+        extra_metrics=extra_metrics,
     )
 
 
@@ -362,6 +448,14 @@ def print_results_table(results: Sequence[BenchmarkResult]) -> None:
     print(separator)
     for row in rows:
         print(" | ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+
+    print()
+    for result in results:
+        if not result.extra_metrics:
+            continue
+        print(f"[{result.method}]")
+        for key, value in result.extra_metrics.items():
+            print(f"  {key}: {value:.2f}")
 
 
 def main() -> None:
