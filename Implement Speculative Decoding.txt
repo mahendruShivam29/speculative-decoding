@@ -1,0 +1,91 @@
+﻿Take-Home Assignment: Implement Speculative Decoding Across Two GPUs
+Goal
+Evaluate the candidate’s ability to:
+1. Understand and implement speculative decoding 
+2. Use two GPUs concurrently 
+3. Measure and analyze performance bottlenecks 
+4. Produce clean, reproducible engineering work 
+Time Limit
+24 hours (it will give you enough time to debug and to think about the implementation and evaluation). If more time is needed, please let us know. 
+Expected Level
+PhD candidate with mixed backgrounds in ML / Systems / HPC.
+Assignment Prompt
+Background
+Speculative decoding (https://arxiv.org/pdf/2211.17192) accelerates LLM inference by using:
+* Draft model (small, fast model) proposes several tokens 
+* Target model (larger, accurate model) verifies them in parallel 
+Instead of generating one token at a time with the target model, multiple draft tokens may be accepted each step.
+You are asked to implement a simplified version using two GPUs.
+Task
+Use Hugging Face Transformers and PyTorch.
+Models
+Use: (ask algos@runara.ai) to confirm models. 
+* target model = Qwen3-235b,
+* draft model = Qwen3-4b,
+
+
+(Or any equivalent pair that fits on your GPUs)
+
+
+Hardware Setup
+Use:
+* GPU0 → Draft model 
+* GPU1 → Target model
+The GPUs could be rented at any NGC, such as aws, gcp, nebius, runpod, vast, etc. 
+Implementation Requirements
+Part 1 — Baseline Greedy Decoding
+Implement standard autoregressive decoding using only the target model.
+Generate 100 tokens for 10 prompts.
+Measure:
+* tokens/sec 
+* latency per token 
+* total runtime 
+Part 2 — Speculative Decoding
+Implement simplified speculative decoding:
+Each iteration:
+1. Draft model generates k=4 tokens on GPU0 
+2. Send proposed sequence to GPU1 
+3. Target model verifies token-by-token 
+4. Accept matching prefix 
+5. Reject first mismatch and replace with target token 
+6. Continue until 100 output tokens generated 
+
+
+Part 3 — Multi-GPU Engineering
+Must explicitly place models on separate devices:
+draft.to("cuda:0")
+target.to("cuda:1")
+Need correct tensor transfers.
+
+
+Part 4 — Benchmark
+Compare:
+Method
+	tok/s
+	avg latency
+	speedup
+	Greedy
+	?
+	?
+	1.0x
+	Speculative
+	?
+	?
+	?
+	Run for:
+* k=2 
+* k=4 
+* k=8 
+
+
+Deliverables
+Required Files
+1. main.py
+Runnable script:
+python main.py
+2. README.md
+Short explanation:
+* Design decisions 
+* Performance results 
+* Bottlenecks found 
+* What you would optimize next
