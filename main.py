@@ -51,12 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-model", default=DEFAULT_DRAFT_MODEL)
     parser.add_argument("--target-model", default=DEFAULT_TARGET_MODEL)
     parser.add_argument("--draft-device", default="cuda:0")
-    parser.add_argument("--target-device", default="cuda:0")
+    parser.add_argument("--target-device", default="cuda:1")
     parser.add_argument("--max-new-tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--ks", type=int, nargs="+", default=[2, 4, 8])
     parser.add_argument("--quantize-4bit", action="store_true")
-    parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="auto")
+    parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="float16")
     parser.add_argument("--prompts-file", default=None)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -154,11 +154,6 @@ def choose_next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     return samples.reshape(*probs.shape[:-1])
 
 
-def sync_if_cuda(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize(device)
-
-
 def truncate_kv_cache(past_key_values, keep_length: int):
     if past_key_values is None:
         return None
@@ -200,7 +195,6 @@ def greedy_generate(
     generated_tokens: List[torch.Tensor] = []
     model_calls = 0
 
-    sync_if_cuda(device)
     start = time.perf_counter()
     with torch.inference_mode():
         past_key_values, next_logits = warmup_model_state(model, input_ids=input_ids, attention_mask=attention_mask)
@@ -212,7 +206,8 @@ def greedy_generate(
             past_key_values = outputs.past_key_values
             next_logits = outputs.logits[:, -1, :]
             model_calls += 1
-    sync_if_cuda(device)
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
     runtime = time.perf_counter() - start
     new_tokens = torch.cat(generated_tokens, dim=-1) if generated_tokens else torch.empty((1, 0), dtype=input_ids.dtype)
     return {
@@ -247,13 +242,8 @@ def speculative_generate(
     target_model_calls = 0
     transferred_proposal_tokens = 0
     transferred_replacement_tokens = 0
+    total_proposed = 0
 
-    draft_time_s = 0.0
-    verify_time_s = 0.0
-    commit_time_s = 0.0
-
-    sync_if_cuda(draft_device)
-    sync_if_cuda(target_device)
     start = time.perf_counter()
     with torch.inference_mode():
         draft_outputs = draft_model(input_ids=prompt_ids_draft, attention_mask=prompt_mask_draft, use_cache=True)
@@ -275,9 +265,7 @@ def speculative_generate(
         while committed_tokens < max_new_tokens:
             steps += 1
             proposal_len = min(k, max_new_tokens - committed_tokens)
-
-            sync_if_cuda(draft_device)
-            t0 = time.perf_counter()
+            total_proposed += proposal_len
             proposals: List[torch.Tensor] = []
             curr_draft_kv = draft_kv
             curr_token = next_token_draft
@@ -290,11 +278,6 @@ def speculative_generate(
                 draft_model_calls += 1
 
             proposal_tensor_draft = torch.cat(proposals, dim=-1)
-            sync_if_cuda(draft_device)
-            draft_time_s += time.perf_counter() - t0
-
-            sync_if_cuda(target_device)
-            t1 = time.perf_counter()
             proposal_tensor_target = proposal_tensor_draft.to(target_device)
             transferred_proposal_tokens += proposal_len
 
@@ -309,13 +292,6 @@ def speculative_generate(
                 if proposal_tensor_target[0, idx] != target_preds[0, idx]:
                     mismatch_index = idx
                     break
-
-            sync_if_cuda(target_device)
-            verify_time_s += time.perf_counter() - t1
-
-            sync_if_cuda(draft_device)
-            sync_if_cuda(target_device)
-            t2 = time.perf_counter()
 
             accepted_proposals = proposal_tensor_target[:, :mismatch_index]
             replacement_token = target_preds[:, mismatch_index : mismatch_index + 1]
@@ -342,17 +318,15 @@ def speculative_generate(
             seq_len = keep_length
             next_token_target = replacement_token
             next_token_draft = next_token_target.to(draft_device)
-
-            sync_if_cuda(draft_device)
-            sync_if_cuda(target_device)
-            commit_time_s += time.perf_counter() - t2
-
-    sync_if_cuda(draft_device)
-    sync_if_cuda(target_device)
+    if draft_device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize(draft_device)
+    if target_device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize(target_device)
     runtime = time.perf_counter() - start
 
     new_tokens = torch.cat(generated_tokens, dim=-1)[:, :max_new_tokens]
-    acceptance_rate = total_accepted / max_new_tokens if max_new_tokens else math.nan
+    acceptance_rate = total_accepted / total_proposed if total_proposed else math.nan
+    draft_fraction_of_output = total_accepted / max_new_tokens if max_new_tokens else math.nan
     accepted_per_step = total_accepted / steps if steps else math.nan
 
     return {
@@ -360,15 +334,14 @@ def speculative_generate(
         "generated_tokens": max_new_tokens,
         "runtime_s": runtime,
         "acceptance_rate": acceptance_rate,
+        "draft_fraction_of_output": draft_fraction_of_output,
         "accepted_tokens_per_step": accepted_per_step,
         "draft_model_calls": draft_model_calls,
         "target_model_calls": target_model_calls,
-        "draft_time_s": draft_time_s,
-        "verify_time_s": verify_time_s,
-        "commit_time_s": commit_time_s,
         "proposal_tokens_transferred": transferred_proposal_tokens,
         "replacement_tokens_transferred": transferred_replacement_tokens,
         "speculative_steps": steps,
+        "total_proposed": total_proposed,
     }
 
 
@@ -389,14 +362,13 @@ def aggregate_results(
         acceptance_rate = statistics.mean(float(run["acceptance_rate"]) for run in runs)
         accepted_tokens_per_step = statistics.mean(float(run["accepted_tokens_per_step"]) for run in runs)
         extra_metrics = {
+            "draft_fraction_of_output": statistics.mean(float(run["draft_fraction_of_output"]) for run in runs),
             "draft_model_calls": statistics.mean(float(run["draft_model_calls"]) for run in runs),
             "target_model_calls": statistics.mean(float(run["target_model_calls"]) for run in runs),
-            "draft_time_s": statistics.mean(float(run["draft_time_s"]) for run in runs),
-            "verify_time_s": statistics.mean(float(run["verify_time_s"]) for run in runs),
-            "commit_time_s": statistics.mean(float(run["commit_time_s"]) for run in runs),
             "proposal_tokens_transferred": statistics.mean(float(run["proposal_tokens_transferred"]) for run in runs),
             "replacement_tokens_transferred": statistics.mean(float(run["replacement_tokens_transferred"]) for run in runs),
             "speculative_steps": statistics.mean(float(run["speculative_steps"]) for run in runs),
+            "total_proposed": statistics.mean(float(run["total_proposed"]) for run in runs),
         }
     elif "model_calls" in runs[0]:
         extra_metrics = {
