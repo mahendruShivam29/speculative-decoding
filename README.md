@@ -104,6 +104,7 @@ python main.py --prompts-file prompts.txt
 - The script keeps `draft_device` and `target_device` as explicit parameters so the same code path can be used for both single-GPU development and real two-GPU validation.
 - The implementation transfers only proposal tokens to the target device and only the replacement token back to the draft device. It does not resend the full context each step.
 - The final benchmark path avoids blocking CUDA synchronizations inside the hot loop so the runtime is closer to true end-to-end throughput.
+- Host transfers are deferred until the end of each prompt, and mismatch detection is vectorized so speculative verification incurs only one host sync per step instead of one per token.
 
 ## Expected bottlenecks
 
@@ -131,6 +132,125 @@ Your final assignment writeup should explain:
 - how acceptance rate changes with `k`,
 - why `k=2`, `k=4`, and `k=8` show different tradeoffs,
 - how much of the runtime is dominated by the target model.
+
+For the current Qwen `0.5B -> 3B` dual-T4 setup, a good explanation is:
+
+- speculative decoding reduces target-model calls substantially, which is the intended effect,
+- but a batch-size-1 draft model is not proportionally as fast as its parameter count suggests,
+- as `k` increases, draft errors compound and the proposed-token acceptance rate drops,
+- once the cost of generating speculative draft tokens exceeds the target-side savings, larger `k` values become slower than greedy decoding.
+
+## Final benchmark results
+
+The final benchmark was run on a Kaggle dual-T4 environment with:
+
+- draft model on `cuda:0`
+- target model on `cuda:1`
+- `float16`
+- 10 prompts
+- 100 generated tokens per prompt
+
+Results:
+
+| Method | tok/s | avg latency (ms/token) | speedup vs greedy |
+| --- | ---: | ---: | ---: |
+| Greedy | 22.34 | 44.76 | 1.00x |
+| Speculative `k=2` | 18.99 | 52.66 | 0.85x |
+| Speculative `k=4` | 16.66 | 60.01 | 0.75x |
+| Speculative `k=8` | 11.74 | 85.16 | 0.53x |
+
+Additional observations:
+
+- Greedy target-model calls: `101` per prompt on average
+- Speculative target-model calls:
+  - `47.4` for `k=2`
+  - `38.1` for `k=4`
+  - `33.4` for `k=8`
+- Proposed-token acceptance rate:
+  - `0.583` for `k=2`
+  - `0.440` for `k=4`
+  - `0.284` for `k=8`
+
+These numbers show that speculative decoding did reduce target-model calls substantially, which means the implementation is functioning correctly. However, the reduction in target work was not enough to offset the draft-model cost and inter-GPU overhead for this specific model pair and hardware setup.
+
+## Latency math
+
+The benchmark generated `1000` total tokens (`10 prompts * 100 tokens`).
+
+### Target model latency
+
+The greedy baseline took `44.76s` to generate `1000` tokens.
+
+- Target latency per token:
+  - `44.76 / 1000 = 0.04476s`
+  - about `45 ms/token`
+
+### Draft model latency estimate from `k=2`
+
+The speculative `k=2` run took `52.66s`.
+
+Average speculative steps per prompt:
+
+- `46.4`
+
+Across `10` prompts, that is:
+
+- `464` total speculative steps
+
+Average latency per speculative step:
+
+- `52.66 / 464 = 0.1135s`
+- about `113 ms/step`
+
+In each `k=2` speculative step, the system performs:
+
+- `1` target verification pass
+- `2` draft passes
+- token transfer between `cuda:0` and `cuda:1`
+
+Using the greedy target latency as a rough estimate for the target pass:
+
+- target contribution per step: about `45 ms`
+- remaining draft + transfer overhead:
+  - `113 ms - 45 ms = 68 ms`
+
+Since `k=2` uses two draft passes per step, the rough draft-side cost is:
+
+- `(68 ms) / 2 = 34 ms` per draft token
+
+### Fatal ratio
+
+This gives the following rough latency ratio:
+
+- target model: `45 ms/token`
+- draft model + transfer overhead: `34 ms/token`
+
+So the target model is only about:
+
+- `45 / 34 = 1.32x`
+
+slower than the draft side.
+
+This is the core reason speculative decoding failed to produce a speedup here. For speculative decoding to help substantially, the target model generally needs to be much slower than the draft model. In this run, the draft side was too expensive relative to the target side.
+
+## Why the draft model is not much faster
+
+Although the draft model has far fewer parameters (`0.5B` vs `3B`), batch-size-1 inference is not determined purely by parameter count.
+
+At this scale, latency is dominated by:
+
+- memory bandwidth,
+- CUDA kernel launch overhead,
+- framework overhead,
+- and inter-GPU transfer/synchronization costs.
+
+The `3B` model does move more weight data than the `0.5B` model, but the smaller model still pays much of the same fixed overhead for each forward pass. As a result, the draft model is not remotely `6x` faster in wall-clock latency, even though it has about `1/6` the parameter count.
+
+This explains the final behavior:
+
+- `k=2` is the best tradeoff for this setup,
+- larger `k` values make acceptance rate worse,
+- and the draft model spends too much time proposing tokens that are later rejected.
 
 ## Honest positioning for the assignment
 

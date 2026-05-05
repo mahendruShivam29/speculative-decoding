@@ -162,18 +162,13 @@ def truncate_kv_cache(past_key_values, keep_length: int):
         past_key_values.crop(keep_length)
         return past_key_values
 
-    truncated_layers = []
-    for layer in past_key_values:
-        truncated_tensors = []
-        for tensor in layer:
-            if tensor is None:
-                truncated_tensors.append(None)
-            elif tensor.ndim >= 3:
-                truncated_tensors.append(tensor[:, :, :keep_length, :])
-            else:
-                truncated_tensors.append(tensor)
-        truncated_layers.append(tuple(truncated_tensors))
-    return tuple(truncated_layers)
+    return tuple(
+        tuple(
+            None if tensor is None else tensor[:, :, :keep_length, :] if tensor.ndim >= 3 else tensor
+            for tensor in layer
+        )
+        for layer in past_key_values
+    )
 
 
 def warmup_model_state(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
@@ -201,7 +196,7 @@ def greedy_generate(
         model_calls += 1
         for _ in range(max_new_tokens):
             next_token = choose_next_token(next_logits, temperature)
-            generated_tokens.append(next_token.cpu())
+            generated_tokens.append(next_token)
             outputs = model(input_ids=next_token, past_key_values=past_key_values, use_cache=True)
             past_key_values = outputs.past_key_values
             next_logits = outputs.logits[:, -1, :]
@@ -209,7 +204,11 @@ def greedy_generate(
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize(device)
     runtime = time.perf_counter() - start
-    new_tokens = torch.cat(generated_tokens, dim=-1) if generated_tokens else torch.empty((1, 0), dtype=input_ids.dtype)
+    new_tokens = (
+        torch.cat(generated_tokens, dim=-1).cpu()
+        if generated_tokens
+        else torch.empty((1, 0), dtype=input_ids.dtype)
+    )
     return {
         "generated_text": tokenizer.decode(new_tokens[0], skip_special_tokens=True),
         "generated_tokens": max_new_tokens,
@@ -258,7 +257,7 @@ def speculative_generate(
         next_token_target = choose_next_token(target_logits, temperature)
         next_token_draft = next_token_target.to(draft_device)
 
-        generated_tokens.append(next_token_target.cpu())
+        generated_tokens.append(next_token_target)
         committed_tokens = 1
         seq_len = prompt_ids_target.shape[1]
 
@@ -287,9 +286,10 @@ def speculative_generate(
             target_preds = choose_next_token(out.logits, temperature)
             target_model_calls += 1
 
+            matches = (proposal_tensor_target[0] == target_preds[0, :proposal_len]).cpu().tolist()
             mismatch_index = proposal_len
-            for idx in range(proposal_len):
-                if proposal_tensor_target[0, idx] != target_preds[0, idx]:
+            for idx, match in enumerate(matches):
+                if not match:
                     mismatch_index = idx
                     break
 
@@ -297,9 +297,9 @@ def speculative_generate(
             replacement_token = target_preds[:, mismatch_index : mismatch_index + 1]
 
             if mismatch_index > 0:
-                generated_tokens.append(accepted_proposals.cpu())
+                generated_tokens.append(accepted_proposals)
             if committed_tokens + mismatch_index < max_new_tokens:
-                generated_tokens.append(replacement_token.cpu())
+                generated_tokens.append(replacement_token)
                 transferred_replacement_tokens += 1
 
             total_accepted += mismatch_index
@@ -324,7 +324,7 @@ def speculative_generate(
         torch.cuda.synchronize(target_device)
     runtime = time.perf_counter() - start
 
-    new_tokens = torch.cat(generated_tokens, dim=-1)[:, :max_new_tokens]
+    new_tokens = torch.cat(generated_tokens, dim=-1)[:, :max_new_tokens].cpu()
     acceptance_rate = total_accepted / total_proposed if total_proposed else math.nan
     draft_fraction_of_output = total_accepted / max_new_tokens if max_new_tokens else math.nan
     accepted_per_step = total_accepted / steps if steps else math.nan
